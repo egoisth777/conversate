@@ -4,9 +4,24 @@ The shared helper is:
 
 `python .claude/skills/conv/scripts/conv_cli.py <command>`
 
+## Store-root resolution
+
+Every command resolves the store root in this order:
+
+1. `--conv-root PATH` (accepted before *or* after the subcommand).
+2. `$BRAIN_CONV`.
+3. **Marker search** — nearest ancestor of the cwd, then of the script dir, that holds
+   a `.conv-root` sentinel (that dir is the root) or a `conv/` subdir (`<dir>/conv` is
+   the root).
+4. Otherwise the command exits 2 with a clear error — it never guesses a path.
+
+`init` writes a `.conv-root` sentinel into the root, so a bootstrapped store is found
+automatically by later commands run from anywhere beneath it. `doctor` prints the
+resolved root plus `resolution: {"layer": flag|env|marker|none, "marker": <path>|null}`.
+
 ## Commands
 
-- `init`: create `conv/`, `conv/log/`, `conv/.semble/`, and rebuild `index.jsonl`.
+- `init`: create `conv/`, `conv/log/`, `conv/.semble/`, write the `.conv-root` sentinel, and rebuild `index.jsonl`.
 - `upsert --stdin`: create or replace a conversation from JSON.
 - `rebuild-index`: rebuild `index.jsonl` from `conv/log/*.md`.
 - `regen-refs`: repair missing reverse refs, then rebuild the index.
@@ -14,7 +29,7 @@ The shared helper is:
 - `search "<query>" [--limit N]`: tiered filename/index/body search.
 - `show <id-or-query> [--markdown]`: print one conversation.
 - `set-status <id> active|parked|closed`: update status and timestamp.
-- `doctor`: validate layout, optional tools, parseability, and index count.
+- `doctor`: report the resolved root + resolution layer, then validate layout, optional tools, parseability, and index count.
 
 ## Turn Counter Shim
 

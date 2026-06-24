@@ -74,14 +74,23 @@ without replaying the chat.
 
 ## The store layout (`conv/`)
 
-The CLI resolves the store root in this order:
-1. `--conv-root` CLI flag, then
-2. `$BRAIN_CONV` environment variable, then
-3. `<repo-root>/conv`, where repo-root is the script's path `parents[4]`
-   (i.e. the CLI expects to live at `<repo>/.claude/skills/conv/scripts/conv_cli.py`).
+The CLI resolves the store root in this order (`resolve_conv_root` → `Resolution`):
+1. `--conv-root` CLI flag (layer `flag`), then
+2. `$BRAIN_CONV` environment variable (layer `env`), then
+3. **marker search** (layer `marker`): walk the current working directory's ancestors,
+   then the script directory's ancestors, nearest-first. A `.conv-root` sentinel file
+   means *that directory* is the root; a `conv/` subdirectory means `<dir>/conv` is the
+   root. The first marker found wins.
+4. else **fail loud** (layer `none`): a clean `ConvError` naming `--conv-root` and
+   `$BRAIN_CONV` — never a path-arithmetic guess.
+
+`init` writes a `.conv-root` sentinel into the resolved root so the store is
+rediscoverable by later bare commands from anywhere beneath it. `doctor` echoes the
+resolution as `resolution = { layer, marker }`.
 
 ```
 conv/
+├── .conv-root           # sentinel marker written by init; makes the store rediscoverable
 ├── log/                 # *.md conversation files — source of truth
 │   └── YYYY-MM-DD_<slug>.md
 ├── index.jsonl          # derived cache, one conversation record per line
@@ -174,7 +183,11 @@ silently and tells the user only `Auto-saved as <id> - rename anytime.`
 ## Current build status (snapshot)
 
 - **Implemented & complete:** `SKILL.md`, all five `references/*.md` playbooks, and
-  the full `scripts/conv_cli.py` (9 subcommands).
+  the full `scripts/conv_cli.py` (9 subcommands). Store-root resolution is
+  marker-based (`flag → env → marker → fail-loud`), `init` writes a `.conv-root`
+  sentinel, and `doctor` reports the resolution layer. The
+  `tests/test_marker_resolution.py` + `tests/test_doctor_resolution_report.py` suite
+  (13 tests) is green.
 - **Stub:** `README.md` (one line).
 - **External / not in repo:** the PowerShell turn-counter hook; the `conv/` store
   itself (created at runtime by `init`).

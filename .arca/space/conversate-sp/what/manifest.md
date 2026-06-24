@@ -21,8 +21,13 @@ skill root (`engineering/conversate/`, deployed as `.claude/skills/conv/`).
 ### `conv_cli.py` internals (what each part does)
 
 **Store resolution & layout**
-- `repo_root_from_script()` / `conv_root()` — resolve the store root (`--conv-root` →
-  `$BRAIN_CONV` → `<repo>/conv`).
+- `resolve_conv_root()` → `Resolution(root, layer, marker)` — resolve the store root by
+  layer (`flag` → `env` → `marker` → `none`). `find_marker()` walks the cwd's then the
+  script dir's ancestors (nearest-first) for a `.conv-root` sentinel or a `conv/` subdir.
+- `conv_root()` / `_root_or_raise()` — unwrap the resolution, raising a clean `ConvError`
+  (naming `--conv-root` + `$BRAIN_CONV`) when nothing resolves — never path arithmetic.
+- `write_sentinel()` — drop a `.conv-root` marker in the root (called by `init`).
+- `resolution_report()` — `{layer, marker}` for `doctor`.
 - `log_dir()`, `index_path()`, `ensure_layout()` — paths for `log/`, `index.jsonl`,
   `.semble/`; create them idempotently.
 
@@ -72,7 +77,7 @@ skill root (`engineering/conversate/`, deployed as `.claude/skills/conv/`).
 
 | command | what it does |
 |---------|--------------|
-| `init` | Create `conv/`, `conv/log/`, `conv/.semble/` and rebuild the index. |
+| `init` | Create `conv/`, `conv/log/`, `conv/.semble/`, write the `.conv-root` sentinel, and rebuild the index. |
 | `upsert --stdin` / `--json PATH` `[--status ...]` | Create or replace a conversation from JSON; reconciles refs and rebuilds index. |
 | `rebuild-index` | Regenerate `index.jsonl` from the log files. |
 | `regen-refs` | Repair missing reverse refs across the store, then rebuild index. |
@@ -80,7 +85,7 @@ skill root (`engineering/conversate/`, deployed as `.claude/skills/conv/`).
 | `search "<query>" [--limit N]` | Tiered filename/index/semantic/body search (JSON output). |
 | `show <id-or-query> [--markdown]` | Print one conversation as JSON record or raw markdown. |
 | `set-status <id> <status>` | Set status to `active`/`parked`/`closed` and bump `updated`. |
-| `doctor` | Validate layout, optional tool availability, file parseability, and index count. |
+| `doctor` | Report the resolved root + resolution layer (`resolution: {layer, marker}`), validate layout, optional tool availability, file parseability, and index count. Tolerates an unresolved root (layer `none`). |
 
 ## references/
 
@@ -107,5 +112,5 @@ agent instructions (what to extract, what order to reconstruct in), not code.
 
 | path | role |
 |------|------|
-| `conv/` (`log/`, `index.jsonl`, `.semble/`) | The conversation store, created at runtime by `init`. |
+| `conv/` (`.conv-root`, `log/`, `index.jsonl`, `.semble/`) | The conversation store, created at runtime by `init`. The `.conv-root` sentinel marks the root for later marker-based resolution. |
 | `.claude/hooks/conv-turn-counter.ps1` | Session turn counter that emits the auto-save reminder past 10 turns. Referenced by `cli.md`; lives in the deployed harness, not this checkout. |
