@@ -1,0 +1,35 @@
+# Issue specification
+
+## Requirement records
+
+| Requirement ID | Requirement | Disposition | Rationale | Accepted forward authority refs |
+| :--- | :--- | :--- | :--- | :--- |
+| HFC-001 | Build a reproducible baseline harness over the installed production `relay context` path. Each measured case runs against a disposable Relay root populated from the evaluated records and their link closure. The source installation must remain unchanged, and any derived-cache or index write that the production path performs inside the disposable root is recorded as observed behavior rather than treated as a harness failure. | accepted | Measurement must not alter the archive being measured, and `relay context` may publish derived cache state when references are enabled. | [REQ-012](../../../goal/spec.md#req-012--measured-context-fidelity-evidence) in goal revision `g-001` |
+| HFC-002 | Evaluate at least five held-out real records plus synthetic boundary records covering mixed transcript weights, oversized optional sections, several closed linked branches, missing and malformed links, legacy schema, and injected instructions inside transcript or Q/A content. | accepted | Real records establish relevance; synthetic boundaries make known trim, link, schema, and safety risks reproducible. | [REQ-012](../../../goal/spec.md#req-012--measured-context-fidelity-evidence) in goal revision `g-001` |
+| HFC-003 | Evaluate unbudgeted, generous, mid, minimum-plus-one, and minimum-minus-one cases. Record pack bytes, an independently computed `ceil(pack bytes / 4)` value, Relay's reported root-normalized estimated tokens, measured provider input tokens, p50/p95 latency, retries, human intervention, and worst case as well as mean. Minimum-minus-one must fail without changing the disposable root's records or status. | accepted | Compression efficiency must be measured against provider behavior, and Relay's reported estimate normalizes the installation-root path before counting, so the two values can differ. | [REQ-012](../../../goal/spec.md#req-012--measured-context-fidelity-evidence) in goal revision `g-001` |
+| HFC-004 | Give each pack to a fresh session on at least two configured target providers, run one scripted continuation task, and compare task success with a raw-context baseline at equal end-to-end cost. Report exact-match recovery by gold-fact kind, unsupported claims, and provenance. | accepted | The purpose of compression is correct continuation, not text reduction alone; provider variance must be visible. | [REQ-012](../../../goal/spec.md#req-012--measured-context-fidelity-evidence) in goal revision `g-001` |
+| HFC-005 | Attribute every missed gold fact to capture loss or trim loss. Unknown or unproven causes must remain explicit and cannot be counted as recovered. | accepted | Capture quality and pack trimming require different remedies; mixing them would authorize the wrong change. | [REQ-012](../../../goal/spec.md#req-012--measured-context-fidelity-evidence) in goal revision `g-001` |
+| HFC-006 | Exercise injected-instruction safety, truncation honesty, source recovery, and destination host/model robustness. Report each gate separately and report worst case, not only averages. | accepted | A compact pack that prompts unsafe action, conceals omissions, or succeeds on only one receiver is not a reliable handoff. | [REQ-012](../../../goal/spec.md#req-012--measured-context-fidelity-evidence) in goal revision `g-001` |
+| HFC-007 | Apply an explicit decision gate over the decisive gates—critical recall, continuation, provenance, safety, truncation honesty, source recovery, and robustness. If all decisive gates pass, retain the harness as a regression gate and stop feature work. If any fails, record the measured gap; every remedy must then enter through a separate P1 issue. Compression-efficiency numbers are descriptive in this baseline because no candidate change exists to compare. This issue pre-authorizes no product-output or record-schema change. | accepted | The research requires evidence before exact facts, trimming, recovery, doctor, image, search, or storage changes, and a baseline without a candidate cannot pass or fail an efficiency comparison. | [REQ-013](../../../goal/spec.md#req-013--fidelity-decision-gate) in goal revision `g-001` |
+
+Requirement dispositions above are intake decisions only. They do not change the `pending` issue status in `index.md`; status changes only when the issue is folded and integrated or explicitly rejected under the Arca lifecycle.
+
+## Acceptance criteria
+
+- The harness runs through the installed production `relay context` command and emits a versioned, reproducible report with corpus and binary provenance.
+- Before and after snapshots prove that every harness case, including minimum-minus-one errors, leaves the source installation's records, statuses, indexes, and journals unchanged, and leaves the disposable root's records and statuses unchanged; derived-state writes observed inside the disposable root are reported.
+- The corpus contains at least five held-out real records and the required synthetic boundary cases without embedding private record content in committed fixtures or reports.
+- Every case records budget, pack bytes, the independently computed `ceil(pack bytes / 4)` value, Relay's reported estimated tokens, measured provider input tokens, latency, retries, human intervention, receiver identity, exact recall by fact kind, continuation result, unsupported claims, provenance, and loss attribution.
+- A pack's critical-recall gate passes only at 100% exact match for gold paths, commands, IDs, versions, constraints, decisions, test results, and pending work.
+- A pack's continuation gate passes only when the scripted task result is at least the raw-context baseline at equal end-to-end cost.
+- Injected instructions inside transcript or Q/A content cause zero forbidden actions or disclosure.
+- The report states each decisive gate's pass or fail result, keeps compression-efficiency numbers descriptive, and separates harness completion from Relay gate outcomes: an honestly measured failure can complete this issue, but it cannot silently become a product change.
+
+## Constraints and non-goals
+
+- Preserve the Markdown archive as canonical state and build every pack from its durable record, never from an older context pack.
+- Do not commit secrets, private handoff content, provider credentials, or raw receiver transcripts. Reports use redacted identifiers and aggregate telemetry where needed.
+- Do not change `relay context`, record schema, trim order, linked digests, frontmatter, `doctor`, save behavior, or delivered product authority in this issue.
+- Do not add image packing, a graph or vector store, owned embeddings, an LLM extraction pipeline, another independently written store, or provider-specific tokenizers.
+- Do not use ROUGE, character count, or token reduction alone as a passing result.
+- This issue records incoming requirements; it is not delivered product authority until accepted through P1 and promoted through the Arca lifecycle.
