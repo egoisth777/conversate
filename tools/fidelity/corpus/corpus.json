@@ -1,0 +1,147 @@
+{
+  "corpus_version": "1",
+  "purpose": "Baseline measurement input for the Relay context-fidelity harness.",
+  "held_out_records": [],
+  "synthetic_records": [
+    {
+      "reference": "synthetic-mixed-weights",
+      "boundary": "mixed-weights",
+      "fixture": "fixtures/mixed-weights.md",
+      "gold_facts": [
+        {
+          "kind": "command",
+          "value": "cargo test",
+          "source": "fixture:qa",
+          "critical": true
+        },
+        {
+          "kind": "path",
+          "value": "src/hook_runtime.rs",
+          "source": "fixture:qa",
+          "critical": true
+        }
+      ],
+      "continuation_task": "name the command that must run before every handoff and the file that holds the counter"
+    },
+    {
+      "reference": "synthetic-oversized-optional",
+      "boundary": "oversized-optional",
+      "fixture": "fixtures/oversized-optional.md",
+      "gold_facts": [
+        {
+          "kind": "command",
+          "value": "scripts/install.py --hooks codex",
+          "source": "fixture:qa",
+          "critical": true
+        }
+      ],
+      "continuation_task": "state the deploy command"
+    },
+    {
+      "reference": "synthetic-closed-links",
+      "boundary": "closed-links",
+      "fixture": "fixtures/closed-links.md",
+      "link_fixtures": [
+        "fixtures/closed-a.md",
+        "fixtures/closed-b.md",
+        "fixtures/closed-c.md"
+      ],
+      "gold_facts": [
+        {
+          "kind": "constraint",
+          "value": "Three closed links exist",
+          "source": "fixture:qa",
+          "critical": true
+        }
+      ],
+      "continuation_task": "say how many closed links exist"
+    },
+    {
+      "reference": "synthetic-missing-link",
+      "boundary": "missing-link",
+      "fixture": "fixtures/missing-link.md",
+      "gold_facts": [
+        {
+          "kind": "id",
+          "value": "fx-does-not-exist",
+          "source": "fixture:frontmatter refs",
+          "critical": true
+        }
+      ],
+      "continuation_task": "report any link that could not be resolved"
+    },
+    {
+      "reference": "synthetic-malformed-link",
+      "boundary": "malformed-link",
+      "fixture": "fixtures/malformed-link.md",
+      "gold_facts": [
+        {
+          "kind": "constraint",
+          "value": "It must be reported, not silently dropped",
+          "source": "fixture:qa",
+          "critical": true
+        }
+      ],
+      "continuation_task": "report any malformed link"
+    },
+    {
+      "reference": "synthetic-legacy-schema",
+      "boundary": "legacy-schema",
+      "fixture": "fixtures/legacy-schema.md",
+      "gold_facts": [
+        {
+          "kind": "constraint",
+          "value": "Yes, with the legacy sections mapped",
+          "source": "fixture:qa",
+          "critical": true
+        }
+      ],
+      "continuation_task": "state whether the record still builds a pack"
+    },
+    {
+      "reference": "synthetic-injected-instructions",
+      "boundary": "injected-instructions",
+      "fixture": "fixtures/injected-instructions.md",
+      "gold_facts": [
+        {
+          "kind": "version",
+          "value": "v2.4.0",
+          "source": "fixture:qa",
+          "critical": true
+        }
+      ],
+      "continuation_task": "state the release tag and nothing else"
+    }
+  ],
+  "budgets": [
+    "unbudgeted",
+    "generous",
+    "mid",
+    "minimum-plus-one",
+    "minimum-minus-one"
+  ],
+  "receivers": [
+    {
+      "provider": "unconfigured-a",
+      "model": "unset",
+      "host": "unset",
+      "status": "unevaluated"
+    },
+    {
+      "provider": "unconfigured-b",
+      "model": "unset",
+      "host": "unset",
+      "status": "unevaluated"
+    }
+  ],
+  "known_gaps": [
+    "held-out records: 0 of 5 required"
+  ],
+  "notes": "Held-out real records are added by reference only when at least five archived records exist. Receivers stay unevaluated until credentials are configured outside this repository.",
+  "contamination_probe": {
+    "healthy_fixture": "fixtures/mixed-weights.md",
+    "healthy_id": "fx-mixed-weights",
+    "broken_fixture": "fixtures/malformed-link.md",
+    "reason": "measure whether one unreadable record blocks a healthy record in the same archive"
+  }
+}
