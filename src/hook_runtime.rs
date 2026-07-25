@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const REMINDER: &str =
@@ -75,8 +75,15 @@ fn process_input(input: &[u8], agent: &str, store: &CounterStore) -> Option<Stri
         return None;
     }
 
-    let count = store.increment(&session)?;
-    (count % 10 == 0).then(|| REMINDER.to_owned())
+    reminder_for(store.increment(&session))
+}
+
+/// The reminder is owed only by a committed count; every other outcome is silent.
+fn reminder_for(outcome: CounterOutcome) -> Option<String> {
+    match outcome {
+        CounterOutcome::Committed(count) if count % 10 == 0 => Some(REMINDER.to_owned()),
+        _ => None,
+    }
 }
 
 fn value_string(value: Option<&Value>) -> String {
@@ -147,39 +154,101 @@ impl Drop for HookLock {
     }
 }
 
-fn try_lock_exclusive(path: &Path) -> io::Result<HookLock> {
-    const MAX_ATTEMPTS: usize = 32;
-    const RETRY_DELAY: Duration = Duration::from_millis(5);
+/// How long an invocation waits for a contended session lock before it reports a
+/// bounded failure. Contention is recoverable, so the wait is a time budget rather
+/// than a fixed number of attempts.
+const LOCK_WAIT_BUDGET: Duration = Duration::from_secs(10);
 
+/// The first backoff step; the wait doubles up to `LOCK_WAIT_MAX_DELAY`.
+const LOCK_WAIT_FIRST_DELAY: Duration = Duration::from_micros(200);
+
+/// The longest single sleep between attempts.
+const LOCK_WAIT_MAX_DELAY: Duration = Duration::from_millis(10);
+
+fn lock_exclusive_within(path: &Path, budget: Duration) -> io::Result<HookLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)?;
-    for attempt in 0..MAX_ATTEMPTS {
+    let deadline = Instant::now() + budget;
+    let mut delay = LOCK_WAIT_FIRST_DELAY;
+    loop {
         match file.try_lock() {
             Ok(()) => return Ok(HookLock(file)),
-            Err(std::fs::TryLockError::WouldBlock) if attempt + 1 < MAX_ATTEMPTS => {
-                thread::sleep(RETRY_DELAY);
-            }
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "hook lock remained held",
-                ));
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "hook lock remained held for the whole wait budget",
+                    ));
+                }
+                thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(LOCK_WAIT_MAX_DELAY);
             }
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        "hook lock remained held",
-    ))
+}
+
+/// The explicit result of one counter update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterOutcome {
+    /// The new count is published and durable.
+    Committed(u64),
+    /// Nothing was published; the previously published counter is intact.
+    FailedBeforeReplacement(CounterFailure),
+    /// The replacement happened but its durability barrier failed; the caller
+    /// must reconcile the stored value before retrying.
+    UncertainDurability { count: u64 },
+}
+
+/// Why an update failed before anything was published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterFailure {
+    /// The session lock stayed held for the whole bounded wait.
+    LockUnavailable,
+    /// The existing counter could not be read.
+    UnreadableCounter,
+    /// The existing counter was not a count; it is reported, never reset.
+    MalformedCounter,
+    /// The count cannot advance without wrapping.
+    Overflow,
+    /// The atomic replacement failed before publishing the new value.
+    WriteFailed,
+}
+
+/// Map an atomic-write stage failure onto the counter contract.
+fn outcome_for_write_stage(stage: crate::atomic_io::WriteStage, count: u64) -> CounterOutcome {
+    match stage {
+        crate::atomic_io::WriteStage::Prepare | crate::atomic_io::WriteStage::Replace => {
+            CounterOutcome::FailedBeforeReplacement(CounterFailure::WriteFailed)
+        }
+        crate::atomic_io::WriteStage::ParentSync => CounterOutcome::UncertainDurability { count },
+    }
 }
 
 struct CounterStore {
     state_dir: PathBuf,
+}
+
+/// Move unparseable counter content aside so the reset leaves evidence behind.
+fn quarantine_counter(counter: &Path) -> io::Result<()> {
+    let quarantine = counter.with_file_name(format!(
+        "{}.corrupt",
+        counter
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "relay-hook.count".to_owned())
+    ));
+    match fs::remove_file(&quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(counter, &quarantine)
 }
 
 impl CounterStore {
@@ -187,19 +256,42 @@ impl CounterStore {
         Self { state_dir }
     }
 
-    fn increment(&self, session: &str) -> Option<u64> {
+    fn increment(&self, session: &str) -> CounterOutcome {
         let hash = session_hash(session);
         let counter = self.state_dir.join(format!("relay-hook-{hash}.count"));
         let lock = self.state_dir.join(format!("relay-hook-{hash}.lock"));
-        let _guard = try_lock_exclusive(&lock).ok()?;
-        let current = fs::read_to_string(&counter)
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        let next = current.checked_add(1)?;
+        let Ok(_guard) = lock_exclusive_within(&lock, LOCK_WAIT_BUDGET) else {
+            return CounterOutcome::FailedBeforeReplacement(CounterFailure::LockUnavailable);
+        };
+        let current = match fs::read_to_string(&counter) {
+            Ok(value) => match value.trim().parse::<u64>() {
+                Ok(current) => current,
+                // A counter that is not a count has no prior value to preserve. The
+                // unparseable content is quarantined as evidence instead of being
+                // overwritten, so the reset is observable rather than silent, and the
+                // session keeps counting instead of wedging its reminders forever.
+                Err(_) => match quarantine_counter(&counter) {
+                    Ok(()) => 0,
+                    Err(_) => {
+                        return CounterOutcome::FailedBeforeReplacement(
+                            CounterFailure::MalformedCounter,
+                        )
+                    }
+                },
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(_) => {
+                return CounterOutcome::FailedBeforeReplacement(CounterFailure::UnreadableCounter)
+            }
+        };
+        let Some(next) = current.checked_add(1) else {
+            return CounterOutcome::FailedBeforeReplacement(CounterFailure::Overflow);
+        };
         let contents = next.to_string();
-        crate::atomic_io::write_atomic(&counter, contents.as_bytes()).ok()?;
-        Some(next)
+        match crate::atomic_io::write_atomic_staged(&counter, contents.as_bytes()) {
+            Ok(()) => CounterOutcome::Committed(next),
+            Err(error) => outcome_for_write_stage(error.stage, next),
+        }
     }
 }
 
@@ -212,6 +304,7 @@ fn session_hash(session: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -220,13 +313,19 @@ mod tests {
         path: PathBuf,
     }
 
+    static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     impl TestTempDir {
         fn new() -> Self {
             let suffix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let root = env::temp_dir().join(format!("relay-hook-test-{suffix}"));
+            let sequence = TEST_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let process = std::process::id();
+            let root = env::temp_dir().join(format!(
+                "relay-hook-test-{process}-{sequence}-{suffix}"
+            ));
             fs::create_dir(&root).unwrap();
             let path = hook_state_dir_from_root(&root).unwrap();
             Self { root, path }
@@ -277,7 +376,200 @@ mod tests {
     }
 
     #[test]
-    fn held_lock_fails_within_retry_bound() {
+    fn test_roots_are_unique_under_parallel_creation() {
+        const THREADS: usize = 16;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut workers = Vec::new();
+        for _ in 0..THREADS {
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                TestTempDir::new()
+            }));
+        }
+        let mut roots = Vec::new();
+        let mut panics = 0;
+        for worker in workers {
+            match worker.join() {
+                Ok(temp) => roots.push(temp),
+                Err(_) => panics += 1,
+            }
+        }
+        assert_eq!(panics, 0, "test root creation panicked");
+        let unique = roots
+            .iter()
+            .map(|temp| temp.root.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), THREADS, "test roots collided");
+    }
+
+    #[test]
+    fn absent_counter_commits_first_turn() {
+        let temp = TestTempDir::new();
+        let store = CounterStore::new(temp.path.clone());
+        assert_eq!(store.increment("fresh"), CounterOutcome::Committed(1));
+    }
+
+    #[test]
+    fn existing_counter_commits_next_value() {
+        let temp = TestTempDir::new();
+        let store = CounterStore::new(temp.path.clone());
+        let counter = temp
+            .path
+            .join(format!("relay-hook-{}.count", session_hash("existing")));
+        fs::write(&counter, b"7").unwrap();
+        assert_eq!(store.increment("existing"), CounterOutcome::Committed(8));
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "8");
+    }
+
+    #[test]
+    fn malformed_counter_is_quarantined_before_counting_restarts() {
+        let temp = TestTempDir::new();
+        let store = CounterStore::new(temp.path.clone());
+        let counter = temp
+            .path
+            .join(format!("relay-hook-{}.count", session_hash("malformed")));
+        let quarantine = temp
+            .path
+            .join(format!("relay-hook-{}.count.corrupt", session_hash("malformed")));
+        fs::write(&counter, b"eighty-seven").unwrap();
+        assert_eq!(store.increment("malformed"), CounterOutcome::Committed(1));
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+        assert_eq!(
+            fs::read_to_string(&quarantine).unwrap(),
+            "eighty-seven",
+            "the unparseable content must survive as evidence of the reset"
+        );
+    }
+
+    #[test]
+    fn unreadable_counter_is_reported() {
+        let temp = TestTempDir::new();
+        let store = CounterStore::new(temp.path.clone());
+        let counter = temp
+            .path
+            .join(format!("relay-hook-{}.count", session_hash("unreadable")));
+        fs::create_dir(&counter).unwrap();
+        assert_eq!(
+            store.increment("unreadable"),
+            CounterOutcome::FailedBeforeReplacement(CounterFailure::UnreadableCounter)
+        );
+        assert!(counter.is_dir());
+    }
+
+    /// A published counter must survive a replacement that never happens.
+    #[cfg(windows)]
+    #[test]
+    fn blocked_replacement_preserves_published_counter() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 1;
+
+        let temp = TestTempDir::new();
+        let store = CounterStore::new(temp.path.clone());
+        let counter = temp
+            .path
+            .join(format!("relay-hook-{}.count", session_hash("blocked-write")));
+        fs::write(&counter, b"41").unwrap();
+        let holder = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&counter)
+            .unwrap();
+        assert_eq!(
+            store.increment("blocked-write"),
+            CounterOutcome::FailedBeforeReplacement(CounterFailure::WriteFailed)
+        );
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "41");
+        drop(holder);
+        assert_eq!(
+            store.increment("blocked-write"),
+            CounterOutcome::Committed(42)
+        );
+    }
+
+    /// A published counter must survive a temporary file that cannot be created.
+    #[cfg(unix)]
+    #[test]
+    fn blocked_replacement_preserves_published_counter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestTempDir::new();
+        let store = CounterStore::new(temp.path.clone());
+        let counter = temp
+            .path
+            .join(format!("relay-hook-{}.count", session_hash("blocked-write")));
+        fs::write(&counter, b"41").unwrap();
+        let lock = temp
+            .path
+            .join(format!("relay-hook-{}.lock", session_hash("blocked-write")));
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&temp.path, fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = store.increment("blocked-write");
+        fs::set_permissions(&temp.path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            outcome,
+            CounterOutcome::FailedBeforeReplacement(CounterFailure::WriteFailed)
+        );
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "41");
+        assert_eq!(
+            store.increment("blocked-write"),
+            CounterOutcome::Committed(42)
+        );
+    }
+
+    #[test]
+    fn saturated_counter_reports_overflow_and_preserves_state() {
+        let temp = TestTempDir::new();
+        let store = CounterStore::new(temp.path.clone());
+        let counter = temp
+            .path
+            .join(format!("relay-hook-{}.count", session_hash("saturated")));
+        fs::write(&counter, u64::MAX.to_string().as_bytes()).unwrap();
+        assert_eq!(
+            store.increment("saturated"),
+            CounterOutcome::FailedBeforeReplacement(CounterFailure::Overflow)
+        );
+        assert_eq!(
+            fs::read_to_string(&counter).unwrap(),
+            u64::MAX.to_string()
+        );
+    }
+
+    #[test]
+    fn write_stages_map_to_distinct_outcomes() {
+        assert_eq!(
+            outcome_for_write_stage(crate::atomic_io::WriteStage::Prepare, 4),
+            CounterOutcome::FailedBeforeReplacement(CounterFailure::WriteFailed)
+        );
+        assert_eq!(
+            outcome_for_write_stage(crate::atomic_io::WriteStage::Replace, 4),
+            CounterOutcome::FailedBeforeReplacement(CounterFailure::WriteFailed)
+        );
+        assert_eq!(
+            outcome_for_write_stage(crate::atomic_io::WriteStage::ParentSync, 4),
+            CounterOutcome::UncertainDurability { count: 4 }
+        );
+    }
+
+    #[test]
+    fn only_committed_counts_emit_the_reminder() {
+        assert_eq!(reminder_for(CounterOutcome::Committed(10)).as_deref(), Some(REMINDER));
+        assert_eq!(reminder_for(CounterOutcome::Committed(11)), None);
+        assert_eq!(
+            reminder_for(CounterOutcome::UncertainDurability { count: 20 }),
+            None
+        );
+        assert_eq!(
+            reminder_for(CounterOutcome::FailedBeforeReplacement(
+                CounterFailure::LockUnavailable
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn contended_lock_waits_and_then_commits() {
         let temp = TestTempDir::new();
         let lock_path = temp
             .path
@@ -286,16 +578,64 @@ mod tests {
         let holder_barrier = Arc::clone(&barrier);
         let holder_path = lock_path.clone();
         let holder = std::thread::spawn(move || {
-            let guard = try_lock_exclusive(&holder_path).unwrap();
+            let guard = lock_exclusive_within(&holder_path, LOCK_WAIT_BUDGET).unwrap();
             holder_barrier.wait();
             std::thread::sleep(std::time::Duration::from_millis(300));
             drop(guard);
         });
         barrier.wait();
         let started = std::time::Instant::now();
-        assert_eq!(CounterStore::new(temp.path.clone()).increment("held"), None);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            CounterStore::new(temp.path.clone()).increment("held"),
+            CounterOutcome::Committed(1),
+            "recoverable contention must never lose a submission"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        assert!(started.elapsed() < LOCK_WAIT_BUDGET);
         holder.join().unwrap();
+    }
+
+    #[test]
+    fn lock_held_past_the_budget_reports_lock_unavailable() {
+        let temp = TestTempDir::new();
+        let lock_path = temp
+            .path
+            .join(format!("relay-hook-{}.lock", session_hash("blocked")));
+        let barrier = Arc::new(Barrier::new(2));
+        let holder_barrier = Arc::clone(&barrier);
+        let holder_path = lock_path.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = lock_exclusive_within(&holder_path, LOCK_WAIT_BUDGET).unwrap();
+            holder_barrier.wait();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(guard);
+        });
+        barrier.wait();
+        let budget = std::time::Duration::from_millis(20);
+        let started = std::time::Instant::now();
+        let outcome = lock_exclusive_within(&lock_path, budget);
+        assert!(
+            outcome.is_err(),
+            "a lock held past the budget must report a bounded failure"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn distinct_sessions_do_not_interfere() {
+        let temp = TestTempDir::new();
+        let store = CounterStore::new(temp.path.clone());
+        let first = "session-alpha";
+        let second = "session-beta";
+        assert_ne!(session_hash(first), session_hash(second));
+        let lock_path = temp
+            .path
+            .join(format!("relay-hook-{}.lock", session_hash(first)));
+        let held = lock_exclusive_within(&lock_path, LOCK_WAIT_BUDGET).unwrap();
+        assert_eq!(store.increment(second), CounterOutcome::Committed(1));
+        drop(held);
+        assert_eq!(store.increment(first), CounterOutcome::Committed(1));
     }
 
     #[test]
@@ -331,30 +671,99 @@ mod tests {
         assert_eq!(process_input(&input, "codex", &store), None);
         assert!(fs::read_dir(&temp.path).unwrap().next().is_none());
     }
-    #[test]
-    fn concurrent_increments_are_not_lost() {
+    /// The expected total is derived from the reported outcomes, so the check does
+    /// not depend on a chosen worker count or a hardcoded counter value.
+    fn run_concurrent_session(workers: usize, session: &'static str) -> (Vec<CounterOutcome>, u64) {
         let temp = Arc::new(TestTempDir::new());
-        let barrier = Arc::new(Barrier::new(16));
-        let mut workers = Vec::new();
-        for _ in 0..16 {
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
             let temp = Arc::clone(&temp);
             let barrier = Arc::clone(&barrier);
-            workers.push(std::thread::spawn(move || {
+            handles.push(std::thread::spawn(move || {
                 let store = CounterStore::new(temp.path.clone());
-                let args = input("UserPromptSubmit", "concurrent-session");
                 barrier.wait();
-                process_input(&args, "codex", &store)
+                store.increment(session)
             }));
         }
-        let reminders = workers
+        let outcomes = handles
             .into_iter()
-            .filter_map(|worker| worker.join().unwrap())
-            .count();
-        assert_eq!(reminders, 1);
-        let counter = temp.path.join(format!(
-            "relay-hook-{}.count",
-            session_hash("concurrent-session")
-        ));
-        assert_eq!(fs::read_to_string(counter).unwrap(), "16");
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let counter = temp
+            .path
+            .join(format!("relay-hook-{}.count", session_hash(session)));
+        let persisted = fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        (outcomes, persisted)
+    }
+
+    #[test]
+    fn concurrent_increments_are_not_lost() {
+        for workers in [2usize, 5, 16, 33] {
+            let (outcomes, persisted) = run_concurrent_session(workers, "concurrent-session");
+            let committed = outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CounterOutcome::Committed(_)))
+                .count();
+            let failed = outcomes
+                .iter()
+                .filter(|outcome| !matches!(outcome, CounterOutcome::Committed(_)))
+                .count();
+            assert_eq!(
+                failed, 0,
+                "recoverable contention reported {failed} failures at {workers} workers: {outcomes:?}"
+            );
+            assert_eq!(
+                persisted, committed as u64,
+                "persisted count must equal the committed submissions at {workers} workers"
+            );
+            let mut counts = outcomes
+                .iter()
+                .filter_map(|outcome| match outcome {
+                    CounterOutcome::Committed(count) => Some(*count),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            counts.sort_unstable();
+            counts.dedup();
+            assert_eq!(
+                counts.len(),
+                committed,
+                "each committed submission must observe a distinct count"
+            );
+        }
+    }
+
+    #[test]
+    fn reminders_follow_committed_tenth_turns() {
+        for start in [0u64, 5, 9, 17, 95] {
+            let temp = TestTempDir::new();
+            let store = CounterStore::new(temp.path.clone());
+            let session = "boundary-session";
+            let counter = temp
+                .path
+                .join(format!("relay-hook-{}.count", session_hash(session)));
+            if start > 0 {
+                fs::write(&counter, start.to_string().as_bytes()).unwrap();
+            }
+            let args = input("UserPromptSubmit", session);
+            for step in 1..=25u64 {
+                let reminder = process_input(&args, "codex", &store);
+                let count = start + step;
+                if count % 10 == 0 {
+                    assert_eq!(
+                        reminder.as_deref(),
+                        Some(REMINDER),
+                        "missing reminder at committed count {count}"
+                    );
+                } else {
+                    assert_eq!(reminder, None, "unexpected reminder at count {count}");
+                }
+            }
+        }
     }
 }

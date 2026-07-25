@@ -57,16 +57,51 @@ impl Drop for SharedLock {
     }
 }
 
+/// The stage of an atomic replacement that failed.
+///
+/// `Prepare` and `Replace` both leave the previous target published, while
+/// `ParentSync` means the replacement already happened and only its durability
+/// barrier is unconfirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteStage {
+    Prepare,
+    Replace,
+    ParentSync,
+}
+
+/// An atomic write failure that keeps the stage it failed in.
+#[derive(Debug)]
+pub struct StagedWriteError {
+    pub stage: WriteStage,
+    pub source: io::Error,
+}
+
+impl From<StagedWriteError> for io::Error {
+    fn from(error: StagedWriteError) -> Self {
+        error.source
+    }
+}
+
 /// Replace `path` with `bytes` without truncating the existing target on failure.
 ///
 /// The temporary file is created in the target's directory, so rename stays on one
 /// filesystem and atomically replaces the previous target on supported filesystems.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
+    write_atomic_staged(path, bytes).map_err(io::Error::from)
+}
+
+/// Replace `path` with `bytes` and report which stage failed.
+///
+/// Callers that must distinguish "nothing was published" from "the replacement
+/// happened but durability is unconfirmed" use this entry point; `write_atomic`
+/// is the same protocol with the stage discarded.
+pub fn write_atomic_staged(path: &Path, bytes: &[u8]) -> Result<(), StagedWriteError> {
+    let file_name = path.file_name().ok_or_else(|| StagedWriteError {
+        stage: WriteStage::Prepare,
+        source: io::Error::new(
             io::ErrorKind::InvalidInput,
             "atomic write path must name a file",
-        )
+        ),
     })?;
     let parent = path
         .parent()
@@ -89,21 +124,37 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
+            Err(source) => {
+                return Err(StagedWriteError {
+                    stage: WriteStage::Prepare,
+                    source,
+                })
+            }
         };
 
-        let result = temp
+        let prepared = temp
             .write_all(bytes)
             .and_then(|_| temp.flush())
             .and_then(|_| temp.sync_all());
         drop(temp);
-        let result = result
-            .and_then(|_| replace_file(&temp_path, path))
-            .and_then(|_| sync_parent(parent));
-        if result.is_err() {
+        if let Err(source) = prepared {
             let _ = fs::remove_file(&temp_path);
+            return Err(StagedWriteError {
+                stage: WriteStage::Prepare,
+                source,
+            });
         }
-        return result;
+        if let Err(source) = replace_file(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(StagedWriteError {
+                stage: WriteStage::Replace,
+                source,
+            });
+        }
+        return sync_parent(parent).map_err(|source| StagedWriteError {
+            stage: WriteStage::ParentSync,
+            source,
+        });
     }
 }
 
